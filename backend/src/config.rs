@@ -15,6 +15,13 @@ pub struct ChannelConfig {
     pub name: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ClientConfig {
+    pub channels: Option<Vec<ChannelConfig>>,
+    pub sample_rate: Option<u32>,
+    pub compression: Option<String>,
+}
+
 const CONFIG_PATH: &str = "config.yaml";
 
 pub async fn load_config() -> Settings {
