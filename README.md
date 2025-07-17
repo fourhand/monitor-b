@@ -608,3 +608,30 @@ if has_extension [object Object]    // Extension 헤더 파싱 (12-28바이트)
 - 클라이언트는 환경변수(`JITTER_INTERPOLATE_MS`, `JITTER_DROP_MS`)가 없을 경우 이 값을 사용합니다.
 - 예시 Rust 코드:
 ```
+```
+
+## 클라이언트 RTP 수신 로그 및 네트워크 모니터링
+
+클라이언트(test-client)는 RTP 패킷 수신 시 다음과 같은 네트워크 품질 정보를 실시간으로 로그로 출력합니다.
+
+- size: 수신된 RTP 패킷의 바이트 크기
+- seq: RTP 시퀀스 번호(패킷 순서)
+- ts: RTP timestamp(샘플 기준 상대 시간)
+- latency: 서버 송신 시각과 클라이언트 수신 시각의 차이(ms, 확장 헤더가 있는 경우만 정확)
+- jitter: 패킷 간 latency 변화량(ms)
+- offset: NTP 기반 서버-클라이언트 시계 오프셋(ms)
+- rtt: NTP 왕복 지연(Round Trip Time, ms)
+- bps: 초당 수신 바이트(kbyte 단위, 실시간 네트워크 대역폭)
+
+### 예시 로그
+```
+[RTP] packet: size=1060, seq=3344, ts=0x00008ac0, latency=0ms, jitter=0ms, offset=0ms, rtt=0ms, bps=1.2kbyte
+[RTP] Extension packet: seq=3350, server_time=1718000000000, latency=15ms, jitter=2ms, offset=0ms, rtt=0ms, bps=1.2kbyte
+```
+
+- bps=1.2kbyte: 현재 초당 약 1.2킬로바이트의 RTP 데이터를 수신 중임을 의미합니다.
+- 오디오 데이터 파싱 및 개별 샘플 값 출력은 로그에서 제거되어, 네트워크 품질 모니터링에 집중할 수 있습니다.
+
+### 참고
+- latency/jitter는 RTP 확장 헤더(server_time_ms)가 있는 패킷에서만 정확하게 측정됩니다.
+- bps는 클라이언트가 수신한 전체 바이트 수를 경과 시간으로 나누어 실시간으로 계산합니다.
