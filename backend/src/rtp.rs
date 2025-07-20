@@ -15,32 +15,35 @@ const RTP_PORT: u16 = 5004;
 const EXTENSION_PROFILE: u16 = 0xBEDE; // RFC3550 표준 프로파일
 const EXTENSION_INTERVAL: u32 = 250; // 5마다 Extension (20 *250 = 5000ms)
 
-// RTP Extension 헤더 구조 (RFC3550)
+// RTP Extension 헤더 구조 (RFC3550 + sample_rate)
 #[derive(Debug)]
 struct RtpExtension {
     profile: u16,        // 0BEDE (표준 프로파일)
     length: u16,         // Extension 데이터 길이 (워드 단위)
     server_time_ms: u64, // 서버 UTC 시각 (ms)
-    event_flags: u8,    // 이벤트 플래그
+    sample_rate: u32,    // 현재 송출 샘플레이트
+    event_flags: u8,     // 이벤트 플래그
     reserved: [u8; 3],   // 예약된 바이트
 }
 
 impl RtpExtension {
-    fn new_time_sync() -> Self {
+    fn new_time_sync(sample_rate: u32) -> Self {
         Self {
             profile: EXTENSION_PROFILE,
-            length: 3, // 3 words
+            length: 4, // 4 words (16 bytes)
             server_time_ms: chrono::Utc::now().timestamp_millis() as u64,
+            sample_rate,
             event_flags: 0b00000001, // time_sync flag
             reserved: [0; 3],
         }
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(16);
+        let mut bytes = Vec::with_capacity(20);
         bytes.extend_from_slice(&self.profile.to_be_bytes());
         bytes.extend_from_slice(&self.length.to_be_bytes());
         bytes.extend_from_slice(&self.server_time_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.sample_rate.to_be_bytes());
         bytes.push(self.event_flags);
         bytes.extend_from_slice(&self.reserved);
         bytes
@@ -245,7 +248,8 @@ pub async fn send_rtp_to_client_with_mapping(
 
                 // RTP 패킷 분할(chunking) 전송
                 let mtu = 1400;
-                let rtp_header_size = if has_extension {28} else {12}; // Extension 포함시 28바이트
+                let sample_rate = config.as_ref().and_then(|c| c.sample_rate).unwrap_or(48000);
+                let rtp_header_size = if has_extension {32} else {12}; // Extension 포함시 32바이트
                 let max_payload_bytes = mtu - rtp_header_size;
                 let total_bytes = payload.len();
                 let mut offset = 0;
@@ -259,7 +263,7 @@ pub async fn send_rtp_to_client_with_mapping(
                     
                     // Extension 헤더 추가 (첫 번째 청크에만)
                     if has_extension && offset == 0 {
-                        let extension = RtpExtension::new_time_sync();
+                        let extension = RtpExtension::new_time_sync(sample_rate);
                         packet.extend_from_slice(&extension.to_bytes());
                     }
                     

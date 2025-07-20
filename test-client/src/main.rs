@@ -7,6 +7,10 @@ use futures::{SinkExt, StreamExt};
 use serde_json::json;
 use serde::{Serialize, Deserialize};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::{self, Read};
+use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct JitterThresholds {
@@ -41,6 +45,23 @@ enum WsEvent {
     },
     #[serde(rename = "close")]
     Close,
+}
+
+// QoS 메트릭 구조체 정의
+#[derive(Serialize)]
+struct QosMetricsData {
+    packets_received: u32,
+    packets_expected: u32,
+    packet_loss_rate: f64,
+    jitter_ms: f64,
+    latency_ms: f64,
+    bandwidth_mbytes_per_sec: f64, // MB/s
+}
+#[derive(Serialize)]
+struct QosMetrics {
+    client_id: String,
+    timestamp: String,
+    metrics: QosMetricsData,
 }
 
 const BACKEND_ADDR: &str = "127.0.0.1:8000";
@@ -87,12 +108,46 @@ async fn get_jitter_thresholds() -> JitterThresholds {
     }
 }
 
+async fn test_rest_apis() {
+    let client = Client::new();
+    // 1. /audio-devices
+    match client.get(&format!("http://{}/audio-devices", BACKEND_ADDR)).send().await {
+        Ok(resp) => println!("[API] /audio-devices: {}", resp.text().await.unwrap_or_default()),
+        Err(e) => println!("[API] /audio-devices error: {}", e),
+    }
+    // 2. /audio-devices/current
+    match client.get(&format!("http://{}/audio-devices/current", BACKEND_ADDR)).send().await {
+        Ok(resp) => println!("[API] /audio-devices/current: {}", resp.text().await.unwrap_or_default()),
+        Err(e) => println!("[API] /audio-devices/current error: {}", e),
+    }
+    // 3. /audio-devices/select (POST)
+    match client.post(&format!("http://{}/audio-devices/select", BACKEND_ADDR))
+        .json(&json!({"id": "hw:1,0"}))
+        .send().await {
+        Ok(resp) => println!("[API] /audio-devices/select: {}", resp.text().await.unwrap_or_default()),
+        Err(e) => println!("[API] /audio-devices/select error: {}", e),
+    }
+    // 4. /qos-status
+    match client.get(&format!("http://{}/qos-status", BACKEND_ADDR)).send().await {
+        Ok(resp) => println!("[API] /qos-status: {}", resp.text().await.unwrap_or_default()),
+        Err(e) => println!("[API] /qos-status error: {}", e),
+    }
+    // 5. /audio-meta
+    match client.get(&format!("http://{}/audio-meta", BACKEND_ADDR)).send().await {
+        Ok(resp) => println!("[API] /audio-meta: {}", resp.text().await.unwrap_or_default()),
+        Err(e) => println!("[API] /audio-meta error: {}", e),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // 지터 임계값 로드
     let jitter_thresholds = get_jitter_thresholds().await;
     println!("[JITTER] Final thresholds: interpolate={}ms, drop={}ms",            jitter_thresholds.interpolate, jitter_thresholds.drop);
 
+    test_rest_apis().await;
+
+    let session_id = Uuid::new_v4().to_string();
     // 1. WebSocket 연결 및 client-config/heartbeat 전송 task
     let ntp_state = Arc::new(Mutex::new((0i64, 0u64))); // (offset, rtt)
     let ntp_state_clone = ntp_state.clone();
@@ -127,6 +182,7 @@ async fn main() {
         // client-config 전송 (예시)
         let client_config = json!({
             "type": "client_config",
+            "session_id": session_id,
             "payload": {
                 "channels": (1..=CHANNELS).map(|id| json!({"id": id, "name": format!("CH{:02}", id), "mute": false})).collect::<Vec<_>>(),
                 "sample_rate": 48000,
@@ -154,6 +210,7 @@ async fn main() {
                 _ = heartbeat_interval.tick() => {
                     let heartbeat = json!({
                         "type": "heartbeat",
+                        "session_id": session_id,
                         "timestamp": chrono::Utc::now().to_rfc3339(),
                     });
                     ws_stream.send(tokio_tungstenite::tungstenite::Message::Text(heartbeat.to_string())).await.unwrap();
@@ -208,6 +265,28 @@ async fn main() {
         }
     });
 
+    let latency_delay_ms = Arc::new(AtomicU64::new(0));
+    let latency_delay_ms_clone = latency_delay_ms.clone();
+    // 키 입력 감지 task
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        for byte in stdin.bytes() {
+            match byte {
+                Ok(b'+') => {
+                    let v = latency_delay_ms_clone.fetch_add(10, Ordering::SeqCst) + 10;
+                    println!("[SIM] latency_delay_ms 증가: {}ms", v);
+                }
+                Ok(b'-') => {
+                    let v = latency_delay_ms_clone.load(Ordering::SeqCst);
+                    let new_v = if v >= 10 { v - 10 } else { 0 };
+                    latency_delay_ms_clone.store(new_v, Ordering::SeqCst);
+                    println!("[SIM] latency_delay_ms 감소: {}ms", new_v);
+                }
+                _ => {}
+            }
+        }
+    });
+
     // 2. RTP 수신 task (기존)
     let rtp_task = tokio::spawn(async move {
         let socket = UdpSocket::bind(("0.0.0.0", LOCAL_PORT)).expect("UDP bind fail");
@@ -216,78 +295,83 @@ async fn main() {
 
         let start = Instant::now();
         let mut buf = [0u8; 4096];
-        let mut total_packets = 0;
-        let mut extension_packets = 0;
+        let mut total_packets = 0u32;
+        let mut extension_packets = 0u32;
         let mut last_latency: Option<i64> = None;
-        let mut total_bytes = 0u64; // 총 수신 바이트 수 추가
-        
-        while start.elapsed() < Duration::from_secs(5) {
+        let mut total_bytes = 0u64;
+        let mut last_sample_rate: Option<u32> = None;
+        let mut last_report = Instant::now();
+        let mut last_seq: Option<u16> = None;
+        let mut last_reported_latency = 0f64;
+        let mut last_reported_jitter = 0f64;
+        let mut last_reported_sample_rate = 48000u32;
+        let client = Client::new();
+        let client_id = format!("test-client:{}", LOCAL_PORT);
+        let mut bytes_in_last_sec = 0u64;
+        let mut last_rtp_report = Instant::now();
+        loop {
             match socket.recv(&mut buf) {
                 Ok(n) if n > 12 => {
                     total_packets += 1;
                     total_bytes += n as u64;
-                    // RTP 헤더 파싱
+                    bytes_in_last_sec += n as u64;
                     let seq = u16::from_be_bytes([buf[2], buf[3]]);
-                    let timestamp = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-                    let ssrc = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-                    let has_extension = (buf[0] & 0x10) != 0; // Extension 플래그 확인
-                    
+                    let has_extension = (buf[0] & 0x10) != 0;
                     let recv_time = chrono::Utc::now().timestamp_millis() as i64;
-                    let (ntp_offset, ntp_rtt) = *ntp_state.lock().unwrap();
-                    
-                    // Bps 계산
-                    let elapsed_secs = start.elapsed().as_secs_f64();
-                    let bps = if elapsed_secs > 0.0 {
-                        (total_bytes as f64 / elapsed_secs) as u64
-                    } else {
-                        0
-                    };
-                    let kbps = bps as f64 / 1024.0;
-                    
-                    // Extension 헤더 파싱 (있는 경우)
+                    let (ntp_offset, _ntp_rtt) = *ntp_state.lock().unwrap();
                     let mut latency = 0i64;
-                    let mut server_time_ms = 0u64;
-                    
-                    if has_extension && n >= 28 {
+                    let mut sample_rate = None;
+                    let mut jitter = 0i64;
+                    if has_extension && n >= 32 {
                         extension_packets += 1;
-                        // Extension 헤더 파싱 (RFC3550 구조)
-                        // bytes 12-13: profile (0xBEDE)
-                        // bytes 14-15: length (3words = 12 bytes)
-                        // bytes 16-23: server_time_ms (8 bytes)
-                        // byte 24: event_flags (1 byte)
-                        // bytes 25-27: reserved (3 bytes)
-                        server_time_ms = u64::from_be_bytes([
+                        let server_time_ms = u64::from_be_bytes([
                             buf[16], buf[17], buf[18], buf[19],
                             buf[20], buf[21], buf[22], buf[23]
                         ]);
-                        let event_flags = buf[24];
-                        
-                        // latency 계산 (서버 시각 기반)
+                        sample_rate = Some(u32::from_be_bytes([
+                            buf[24], buf[25], buf[26], buf[27]
+                        ]));
                         latency = (recv_time + ntp_offset) - server_time_ms as i64;
-                        
-                        // jitter 계산
-                        let jitter = if let Some(last) = last_latency {
+                        jitter = if let Some(last) = last_latency {
                             (latency - last).abs()
-                        } else {
-                            0                   };
+                        } else { 0 };
                         last_latency = Some(latency);
-                        
-                        println!("[RTP] Extension packet: seq={}, server_time={}, latency={}ms, jitter={}ms, offset={}ms, rtt={}ms, bps={:.1}kbyte", seq, server_time_ms, latency, jitter, ntp_offset, ntp_rtt, kbps);
-                    } else {
-                        // 확장 헤더 없는 경우: 이전 값을 그대로 사용
-                        let (latency, jitter) = if let Some(last) = last_latency {
-                            (last, 0)
-                        } else {
-                            (0, 0)
-                        };
-                        println!(
-                            "[RTP] packet: size={}, seq={}, ts=0x{:08x}, latency={}ms, jitter={}ms, offset={}ms, rtt={}ms, bps={:.1}kbyte",
-                            n, seq, timestamp, latency, jitter, ntp_offset, ntp_rtt, kbps
-                        );
+                        if let Some(sr) = sample_rate {
+                            last_reported_sample_rate = sr;
+                        }
+                        last_reported_latency = latency as f64;
+                        last_reported_jitter = jitter as f64;
                     }
-                    
-                    let payload = &buf[if has_extension { 28 } else { 12 }..n];
-                    // 오디오 데이터 파싱 및 출력 코드 제거 (불필요)
+                    // QoS 메트릭 주기적 보고 (1초마다)
+                    if last_report.elapsed() >= Duration::from_secs(1) {
+                        let metrics = QosMetrics {
+                            client_id: client_id.clone(),
+                            session_id: session_id.clone(),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            metrics: QosMetricsData {
+                                packets_received: total_packets,
+                                packets_expected: total_packets, // 실제로는 seq 기반 계산 필요
+                                packet_loss_rate: 0.0, // 실제로는 loss 계산 필요
+                                jitter_ms: last_reported_jitter,
+                                latency_ms: last_reported_latency,
+                                bandwidth_mbytes_per_sec: (total_bytes as f64) / (start.elapsed().as_secs_f64() * 1_048_576.0 + 1.0), // MB/s
+                            },
+                        };
+                        let _ = client.post(&format!("http://{}/qos-metrics", BACKEND_ADDR))
+                            .json(&metrics)
+                            .send().await;
+                        println!("[QoS] Reported to server: latency={}ms, jitter={}ms, sample_rate={}, bandwidth={:.3} MB/s", last_reported_latency, last_reported_jitter, last_reported_sample_rate, metrics.metrics.bandwidth_mbytes_per_sec);
+                        last_report = Instant::now();
+                    }
+                    // 1초마다 수신량 출력
+                    if last_rtp_report.elapsed() >= Duration::from_secs(1) {
+                        let mb = bytes_in_last_sec as f64 / 1_048_576.0;
+                        let cur_delay = latency_delay_ms.load(Ordering::SeqCst);
+                        println!("[RTP] 1초간 수신량: {:.3} MB, sample_rate: {}, latency_delay_ms: {}ms", mb, last_reported_sample_rate, cur_delay);
+                        bytes_in_last_sec = 0;
+                        last_rtp_report = Instant::now();
+                    }
+                    last_seq = Some(seq);
                 }
                 Ok(_) => {
                     println!("[RTP] Received packet too small");
