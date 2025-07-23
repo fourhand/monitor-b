@@ -15,8 +15,8 @@ use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use axum::extract;
-use std::fs::OpenOptions;
-use std::io::Write;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
 use chrono::Utc;
 use serde_json::json;
 use tokio::task::JoinHandle;
@@ -136,7 +136,13 @@ mod audio;
 mod database;
 
 // QoS 상태 변화 감지 및 파일 로그 기록 함수
-fn log_qos_status_change(client_id: &str, status: &str, sample_rate: u32, latency: f64, jitter: f64) {
+async fn log_qos_status_change(
+    client_id: &str,
+    status: &str,
+    sample_rate: u32,
+    latency: f64,
+    jitter: f64,
+) -> std::io::Result<()> {
     let now = Utc::now().to_rfc3339();
     let log_line = format!(
         "[{}] {} QoS {}: sample_rate={} latency={}ms jitter={}ms\n",
@@ -146,8 +152,9 @@ fn log_qos_status_change(client_id: &str, status: &str, sample_rate: u32, latenc
         .create(true)
         .append(true)
         .open("qos_status.log")
-        .unwrap();
-    let _ = file.write_all(log_line.as_bytes());
+        .await?;
+    file.write_all(log_line.as_bytes()).await?;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -245,13 +252,21 @@ async fn main() {
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8000));
     tracing::info!("Starting server on {}", addr);
-    let listener = TcpListener::bind(addr).await.unwrap();
-    axum::serve(
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("Failed to bind to {}: {}", addr, e);
+            return;
+        }
+    };
+    if let Err(e) = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
-    .unwrap();
+    {
+        tracing::error!("Server error: {}", e);
+    }
 }
 
 async fn websocket_handler(
@@ -672,13 +687,17 @@ async fn qos_metrics(
                 settings.sample_rate
             }
         };
-        log_qos_status_change(
+        if let Err(e) = log_qos_status_change(
             &client_id,
             status,
             sample_rate,
             qos.metrics.latency_ms,
             qos.metrics.jitter_ms,
-        );
+        )
+        .await
+        {
+            tracing::error!("Failed to log QoS status change: {}", e);
+        }
         qos_map.insert(client_id.clone(), status.to_string());
     }
     Json(serde_json::json!({
